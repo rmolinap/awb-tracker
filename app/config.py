@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     screenshot_dir: str = "./screenshots"
     playwright_headless: bool = True
     playwright_slowmo_ms: int = 0
+    oxylabs_enabled: bool = False
+    oxylabs_username: str = ""
+    oxylabs_password: str = ""
+    oxylabs_endpoint: str = "https://realtime.oxylabs.io/v1/queries"
 
     model_config = SettingsConfigDict(
         env_file=".env",

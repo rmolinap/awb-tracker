@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import random
 import re
 from pathlib import Path
 from typing import Any, Optional
 
 from playwright.async_api import Browser, BrowserContext, Error as PlaywrightError
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Page, Playwright, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from app.config import settings
 from app.models import ShipmentRequest, TrackingResult
 from app.services.normalize import normalize_awb
+from app.services.oxylabs import fetch_with_oxylabs
 from app.trackers.base import BaseTracker
 
 
@@ -28,6 +30,15 @@ ACCESS_DENIED_MARKERS = (
     "reference #",
     "errors.edgesuite.net",
 )
+HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:article|aside|br|div|footer|h[1-6]|header|li|main|ol|p|section|table|td|th|tr|ul)[^>]*>",
+    re.IGNORECASE,
+)
+HTML_SCRIPT_STYLE_RE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 STEALTH_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {
   get: () => undefined,
@@ -72,6 +83,10 @@ def detect_access_denied(text: str) -> bool:
     return any(marker in haystack for marker in ACCESS_DENIED_MARKERS)
 
 
+def is_closed_resource_error(exc: Exception) -> bool:
+    return "target page, context or browser has been closed" in str(exc).lower()
+
+
 def build_access_denied_screenshot_path(
     screenshot_dir: str | Path,
     awb: str,
@@ -84,6 +99,54 @@ def build_access_denied_screenshot_path(
             attempt=attempt_number,
         )
     )
+
+
+async def safe_close_page(page: Optional[Page]) -> Optional[str]:
+    if page is None:
+        return None
+    try:
+        await page.close()
+    except Exception as exc:
+        if is_closed_resource_error(exc):
+            return None
+        return "Delta page cleanup failed: {error}".format(error=exc)
+    return None
+
+
+async def safe_close_context(context: Optional[BrowserContext]) -> Optional[str]:
+    if context is None:
+        return None
+    try:
+        await context.close()
+    except Exception as exc:
+        if is_closed_resource_error(exc):
+            return None
+        return "Delta browser context cleanup failed: {error}".format(error=exc)
+    return None
+
+
+async def safe_close_browser(browser: Optional[Browser]) -> Optional[str]:
+    if browser is None:
+        return None
+    try:
+        await browser.close()
+    except Exception as exc:
+        if is_closed_resource_error(exc):
+            return None
+        return "Delta browser cleanup failed: {error}".format(error=exc)
+    return None
+
+
+async def safe_stop_playwright(playwright: Optional[Playwright]) -> Optional[str]:
+    if playwright is None:
+        return None
+    try:
+        await playwright.stop()
+    except Exception as exc:
+        if is_closed_resource_error(exc):
+            return None
+        return "Delta Playwright shutdown failed: {error}".format(error=exc)
+    return None
 
 
 class DeltaTracker(BaseTracker):
@@ -132,7 +195,9 @@ class DeltaTracker(BaseTracker):
         result.exception = parsed_fields["exception"]
         result.screenshot_path = raw_summary.get("screenshot_path")
 
-        if raw_summary.get("access_denied_detected") and not parsed_fields["status"]:
+        if raw_summary.get("fetch_failed"):
+            result.error = raw_summary.get("warning", "Delta tracking fetch failed.")
+        elif raw_summary.get("access_denied_detected") and not parsed_fields["status"]:
             result.error = raw_summary.get(
                 "warning",
                 "Delta Cargo access denied by Akamai.",
@@ -213,49 +278,66 @@ class DeltaTracker(BaseTracker):
         original_awb: str,
     ) -> dict[str, Any]:
         normalized_awb = normalize_awb(original_awb)
+        playwright: Optional[Playwright] = None
         browser: Optional[Browser] = None
         context: Optional[BrowserContext] = None
+        summary: Optional[dict[str, Any]] = None
 
         try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=settings.playwright_headless,
-                    slow_mo=settings.playwright_slowmo_ms,
-                    args=self._browser_launch_args(),
-                    ignore_default_args=["--enable-automation"],
-                )
-                context = await browser.new_context(
-                    user_agent=REALISTIC_USER_AGENT,
-                    viewport=REALISTIC_VIEWPORT,
-                    locale="en-US",
-                    timezone_id="America/Los_Angeles",
-                    java_script_enabled=True,
-                    extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
-                )
-                await context.add_init_script(STEALTH_INIT_SCRIPT)
-                return await self._fetch_with_retries(
-                    context=context,
-                    tracking_url=tracking_url,
-                    original_awb=original_awb,
-                    normalized_awb=normalized_awb,
-                )
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=settings.playwright_headless,
+                slow_mo=settings.playwright_slowmo_ms,
+                args=self._browser_launch_args(),
+                ignore_default_args=["--enable-automation"],
+            )
+            context = await browser.new_context(
+                user_agent=REALISTIC_USER_AGENT,
+                viewport=REALISTIC_VIEWPORT,
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
+                java_script_enabled=True,
+                extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
+            )
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            summary = await self._fetch_with_retries(
+                context=context,
+                tracking_url=tracking_url,
+                original_awb=original_awb,
+                normalized_awb=normalized_awb,
+            )
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
-            return self._build_error_summary(
+            summary = self._build_error_summary(
                 tracking_url=tracking_url,
                 normalized_awb=normalized_awb,
                 warning=str(exc),
             )
         except Exception as exc:
-            return self._build_error_summary(
+            summary = self._build_error_summary(
                 tracking_url=tracking_url,
                 normalized_awb=normalized_awb,
                 warning=str(exc),
             )
         finally:
-            if context is not None:
-                await context.close()
-            if browser is not None:
-                await browser.close()
+            cleanup_warning = self._combine_cleanup_warnings(
+                await safe_close_context(context),
+                await safe_close_browser(browser),
+                await safe_stop_playwright(playwright),
+            )
+            if summary is None:
+                summary = self._build_error_summary(
+                    tracking_url=tracking_url,
+                    normalized_awb=normalized_awb,
+                    warning=cleanup_warning or "Delta tracker did not capture a response.",
+                )
+            elif cleanup_warning:
+                self._record_cleanup_warning(summary, cleanup_warning)
+
+        return await self._maybe_apply_oxylabs_fallback(
+            tracking_url=tracking_url,
+            normalized_awb=normalized_awb,
+            summary=summary,
+        )
 
     def _browser_launch_args(self) -> list[str]:
         return [
@@ -321,9 +403,11 @@ class DeltaTracker(BaseTracker):
         normalized_awb: str,
         attempt_number: int,
     ) -> dict[str, Any]:
-        page = await context.new_page()
+        page: Optional[Page] = None
+        summary: Optional[dict[str, Any]] = None
 
         try:
+            page = await context.new_page()
             await page.goto(
                 tracking_url,
                 wait_until="domcontentloaded",
@@ -333,14 +417,17 @@ class DeltaTracker(BaseTracker):
 
             visible_text = await page.locator("body").inner_text()
             page_title = await self._safe_page_title(page)
-            final_url = page.url
+            final_url = self._safe_page_url(page, tracking_url)
             summary = {
                 "tracking_url": tracking_url,
                 "normalized_awb": normalized_awb,
                 "visible_text": visible_text,
                 "page_title": page_title,
                 "final_url": final_url,
+                "retry_count": 0,
+                "access_denied_detected": detect_access_denied(visible_text),
                 "screenshot_path": None,
+                "fetch_failed": False,
             }
 
             if detect_access_denied(self._build_access_denied_haystack(summary)):
@@ -349,47 +436,143 @@ class DeltaTracker(BaseTracker):
                     original_awb=original_awb,
                     attempt_number=attempt_number,
                 )
-
-            return summary
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
-            return {
-                "tracking_url": tracking_url,
-                "normalized_awb": normalized_awb,
-                "visible_text": "",
-                "page_title": await self._safe_page_title(page),
-                "final_url": page.url or tracking_url,
-                "screenshot_path": None,
-                "warning": str(exc),
-            }
+            summary = self._build_error_summary(
+                tracking_url=tracking_url,
+                normalized_awb=normalized_awb,
+                warning=str(exc),
+                page_title=await self._safe_page_title(page),
+                final_url=self._safe_page_url(page, tracking_url),
+            )
         except Exception as exc:
-            return {
+            summary = self._build_error_summary(
+                tracking_url=tracking_url,
+                normalized_awb=normalized_awb,
+                warning=str(exc),
+                page_title=await self._safe_page_title(page),
+                final_url=self._safe_page_url(page, tracking_url),
+            )
+        finally:
+            page_close_warning = await safe_close_page(page)
+            if summary is None:
+                summary = self._build_error_summary(
+                    tracking_url=tracking_url,
+                    normalized_awb=normalized_awb,
+                    warning=page_close_warning or "Delta page did not return a response.",
+                    page_title=await self._safe_page_title(page),
+                    final_url=self._safe_page_url(page, tracking_url),
+                )
+            elif page_close_warning:
+                self._record_cleanup_warning(summary, page_close_warning)
+
+        return summary
+
+    def _should_try_oxylabs(self, summary: dict[str, Any]) -> bool:
+        return settings.oxylabs_enabled and summary.get("access_denied_detected") is True
+
+    async def _maybe_apply_oxylabs_fallback(
+        self,
+        tracking_url: str,
+        normalized_awb: str,
+        summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolved_summary = self._ensure_oxylabs_metadata(summary)
+        if not self._should_try_oxylabs(resolved_summary):
+            return resolved_summary
+
+        return await self._fetch_tracking_page_with_oxylabs(
+            tracking_url=tracking_url,
+            normalized_awb=normalized_awb,
+            current_summary=resolved_summary,
+        )
+
+    async def _fetch_tracking_page_with_oxylabs(
+        self,
+        tracking_url: str,
+        normalized_awb: str,
+        current_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        summary = self._ensure_oxylabs_metadata(dict(current_summary))
+        summary["oxylabs_used"] = True
+
+        oxylabs_result = await asyncio.to_thread(fetch_with_oxylabs, tracking_url)
+        summary["oxylabs_status_code"] = oxylabs_result.get("status_code")
+        summary["oxylabs_error"] = oxylabs_result.get("error")
+
+        if not oxylabs_result.get("ok"):
+            return summary
+
+        oxylabs_visible_text = self._extract_visible_text_from_content(
+            oxylabs_result.get("content", "")
+        )
+        if detect_access_denied(oxylabs_visible_text):
+            summary["oxylabs_error"] = (
+                "Oxylabs response still matched Delta access denied markers."
+            )
+            return summary
+
+        summary.update(
+            {
                 "tracking_url": tracking_url,
                 "normalized_awb": normalized_awb,
-                "visible_text": "",
-                "page_title": await self._safe_page_title(page),
-                "final_url": page.url or tracking_url,
-                "screenshot_path": None,
-                "warning": str(exc),
+                "visible_text": oxylabs_visible_text,
+                "page_title": "Delta Cargo via Oxylabs",
+                "final_url": oxylabs_result.get("result_url") or tracking_url,
+                "playwright_access_denied_detected": current_summary.get(
+                    "access_denied_detected",
+                    False,
+                ),
+                "access_denied_detected": False,
+                "fetch_failed": False,
+                "warning": None,
+                "oxylabs_content": oxylabs_result.get("content"),
             }
-        finally:
-            await page.close()
+        )
+        return summary
 
     def _build_error_summary(
         self,
         tracking_url: str,
         normalized_awb: str,
         warning: str,
+        *,
+        visible_text: str = "",
+        page_title: Optional[str] = None,
+        final_url: Optional[str] = None,
+        retry_count: int = 0,
+        access_denied_detected: Optional[bool] = None,
+        screenshot_path: Optional[str] = None,
+        fetch_failed: bool = True,
     ) -> dict[str, Any]:
+        resolved_final_url = final_url or tracking_url
+        if access_denied_detected is None:
+            access_denied_detected = detect_access_denied(
+                " ".join(
+                    part
+                    for part in (
+                        visible_text,
+                        page_title or "",
+                        resolved_final_url,
+                        warning,
+                    )
+                    if part
+                )
+            )
+
         return {
             "tracking_url": tracking_url,
             "normalized_awb": normalized_awb,
-            "visible_text": "",
-            "page_title": None,
-            "final_url": tracking_url,
-            "retry_count": 0,
-            "access_denied_detected": False,
-            "screenshot_path": None,
+            "visible_text": visible_text,
+            "page_title": page_title,
+            "final_url": resolved_final_url,
+            "retry_count": retry_count,
+            "access_denied_detected": access_denied_detected,
+            "screenshot_path": screenshot_path,
+            "fetch_failed": fetch_failed,
             "warning": warning,
+            "oxylabs_used": False,
+            "oxylabs_status_code": None,
+            "oxylabs_error": None,
         }
 
     def _build_access_denied_haystack(self, summary: dict[str, Any]) -> str:
@@ -407,11 +590,21 @@ class DeltaTracker(BaseTracker):
         except PlaywrightTimeoutError:
             return
 
-    async def _safe_page_title(self, page: Page) -> Optional[str]:
+    async def _safe_page_title(self, page: Optional[Page]) -> Optional[str]:
+        if page is None:
+            return None
         try:
             return await page.title()
         except Exception:
             return None
+
+    def _safe_page_url(self, page: Optional[Page], fallback_url: str) -> str:
+        if page is None:
+            return fallback_url
+        try:
+            return page.url or fallback_url
+        except Exception:
+            return fallback_url
 
     async def _sleep_before_retry(self) -> None:
         await asyncio.sleep(random.uniform(0.75, 1.75))
@@ -434,3 +627,34 @@ class DeltaTracker(BaseTracker):
         )
         await page.screenshot(path=str(screenshot_path), full_page=True)
         return str(screenshot_path)
+
+    def _combine_cleanup_warnings(self, *warnings: Optional[str]) -> Optional[str]:
+        filtered = [warning for warning in warnings if warning]
+        if not filtered:
+            return None
+        return " | ".join(filtered)
+
+    def _record_cleanup_warning(
+        self,
+        summary: dict[str, Any],
+        cleanup_warning: str,
+    ) -> None:
+        if summary.get("warning"):
+            summary["cleanup_warning"] = cleanup_warning
+            return
+        summary["warning"] = cleanup_warning
+
+    def _ensure_oxylabs_metadata(self, summary: dict[str, Any]) -> dict[str, Any]:
+        summary.setdefault("oxylabs_used", False)
+        summary.setdefault("oxylabs_status_code", None)
+        summary.setdefault("oxylabs_error", None)
+        return summary
+
+    def _extract_visible_text_from_content(self, content: str) -> str:
+        if "<" not in content or ">" not in content:
+            return content
+
+        without_scripts = HTML_SCRIPT_STYLE_RE.sub(" ", content)
+        with_block_breaks = HTML_BLOCK_TAG_RE.sub("\n", without_scripts)
+        without_tags = HTML_TAG_RE.sub(" ", with_block_breaks)
+        return html.unescape(without_tags)

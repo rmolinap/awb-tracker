@@ -26,6 +26,7 @@ app/
   services/
     __init__.py
     normalize.py
+    oxylabs.py
 tests/
   fixtures/
 ```
@@ -60,6 +61,10 @@ Available settings:
 - `SCREENSHOT_DIR`
 - `PLAYWRIGHT_HEADLESS`
 - `PLAYWRIGHT_SLOWMO_MS`
+- `OXYLABS_ENABLED`
+- `OXYLABS_USERNAME`
+- `OXYLABS_PASSWORD`
+- `OXYLABS_ENDPOINT`
 
 ## Run the app
 
@@ -140,26 +145,34 @@ Current mitigation in the Delta tracker:
 - removes common automation flags where Playwright allows it
 - injects lightweight stealth overrides such as hiding `navigator.webdriver`
 - retries up to two times when the response looks like an Akamai denial page
+- calls Oxylabs Web Scraper API only after those direct retries still end in Akamai denial and `OXYLABS_ENABLED=true`
 - captures screenshots of denied pages when `ENABLE_SCREENSHOTS=true`
-- returns structured JSON with `page_title`, `final_url`, `retry_count`, and `access_denied_detected` in `raw_summary`
+- returns structured JSON with `page_title`, `final_url`, `retry_count`, `access_denied_detected`, `oxylabs_used`, `oxylabs_status_code`, and `oxylabs_error` in `raw_summary`
 
 This reduces obvious bot fingerprints, but it does not guarantee access. Akamai can still block direct requests from the local machine or hosting environment.
 
-## Future proxy fallback
+## Oxylabs fallback
 
-Oxylabs is not enabled yet in this phase. The Delta tracker has been kept modular so a future proxy fallback can be added at the fetch layer without replacing the parser or changing the API response schema.
+The Oxylabs fallback is implemented for Delta only. It is intentionally narrow:
+- direct Playwright remains the first attempt for every Delta request
+- Oxylabs is skipped unless `OXYLABS_ENABLED=true`
+- Oxylabs is only called when the direct Delta flow detects an Akamai denial page after retries
+- the same Delta parser is reused by converting the Oxylabs HTML response into visible text before parsing
+- if Oxylabs still fails, the original Akamai error stays in `error` and `raw_summary.oxylabs_error` explains the fallback failure
 
-Planned direction:
-- keep the current direct Playwright path as the first attempt
-- add a proxy-backed fetch strategy only when Akamai denials remain persistent
-- preserve the same `TrackingResult` and `raw_summary` contract for n8n
+Required env vars:
+- `OXYLABS_ENABLED=false`
+- `OXYLABS_USERNAME=`
+- `OXYLABS_PASSWORD=`
+- `OXYLABS_ENDPOINT=https://realtime.oxylabs.io/v1/queries`
 
 ## Troubleshooting Delta access denied
 
 If Delta returns an Akamai denial page:
 - confirm Playwright browsers are installed with `playwright install chromium`
 - inspect `raw_summary.page_title`, `raw_summary.final_url`, `raw_summary.retry_count`, and `raw_summary.access_denied_detected`
+- if Oxylabs is enabled, also inspect `raw_summary.oxylabs_used`, `raw_summary.oxylabs_status_code`, and `raw_summary.oxylabs_error`
 - enable screenshots with `ENABLE_SCREENSHOTS=true` and review the saved denied-page image
 - keep `PLAYWRIGHT_HEADLESS=true` for server environments, but try local debugging with `PLAYWRIGHT_HEADLESS=false`
 - use a small non-zero `PLAYWRIGHT_SLOWMO_MS` only for debugging; it is not a proxy substitute
-- if denials remain consistent across retries, treat that as a network reputation problem and plan the Oxylabs fallback rather than changing the parser
+- if denials remain consistent across retries, enable the Delta-only Oxylabs fallback rather than changing the parser

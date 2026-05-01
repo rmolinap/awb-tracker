@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from app.config import settings
 from app.models import ShipmentRequest
 from app.trackers.delta import (
     DeltaTracker,
@@ -260,3 +261,267 @@ async def test_delta_fetch_stops_after_max_access_denied_retries(monkeypatch) ->
     assert summary["retry_count"] == 2
     assert summary["access_denied_detected"] is True
     assert summary["warning"] == "Delta Cargo access denied by Akamai after retries."
+
+
+@pytest.mark.asyncio
+async def test_delta_does_not_call_oxylabs_when_disabled(monkeypatch) -> None:
+    tracker = DeltaTracker()
+    called = False
+
+    async def fake_oxylabs_fallback(
+        tracking_url: str,
+        normalized_awb: str,
+        current_summary: dict[str, object],
+    ) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return current_summary
+
+    monkeypatch.setattr(settings, "oxylabs_enabled", False)
+    monkeypatch.setattr(tracker, "_fetch_tracking_page_with_oxylabs", fake_oxylabs_fallback)
+
+    summary = await tracker._maybe_apply_oxylabs_fallback(
+        tracking_url="https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+        normalized_awb="00622953556",
+        summary={
+            "tracking_url": "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+            "normalized_awb": "00622953556",
+            "visible_text": "Access Denied\nReference #18.abc123",
+            "access_denied_detected": True,
+            "fetch_failed": False,
+            "warning": "Delta Cargo access denied by Akamai after retries.",
+        },
+    )
+
+    assert called is False
+    assert summary["oxylabs_used"] is False
+    assert summary["oxylabs_status_code"] is None
+    assert summary["oxylabs_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_delta_calls_oxylabs_when_enabled_and_access_denied_occurs(
+    monkeypatch,
+) -> None:
+    tracker = DeltaTracker()
+    called = False
+
+    async def fake_oxylabs_fallback(
+        tracking_url: str,
+        normalized_awb: str,
+        current_summary: dict[str, object],
+    ) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {
+            **current_summary,
+            "oxylabs_used": True,
+            "oxylabs_status_code": 200,
+            "oxylabs_error": None,
+        }
+
+    monkeypatch.setattr(settings, "oxylabs_enabled", True)
+    monkeypatch.setattr(tracker, "_fetch_tracking_page_with_oxylabs", fake_oxylabs_fallback)
+
+    summary = await tracker._maybe_apply_oxylabs_fallback(
+        tracking_url="https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+        normalized_awb="00622953556",
+        summary={
+            "tracking_url": "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+            "normalized_awb": "00622953556",
+            "visible_text": "Access Denied\nReference #18.abc123",
+            "access_denied_detected": True,
+            "fetch_failed": False,
+            "warning": "Delta Cargo access denied by Akamai after retries.",
+        },
+    )
+
+    assert called is True
+    assert summary["oxylabs_used"] is True
+    assert summary["oxylabs_status_code"] == 200
+
+
+@pytest.mark.asyncio
+async def test_delta_oxylabs_failure_keeps_original_akamai_error(monkeypatch) -> None:
+    tracker = DeltaTracker()
+    monkeypatch.setattr(
+        "app.trackers.delta.fetch_with_oxylabs",
+        lambda url: {
+            "ok": False,
+            "status_code": 502,
+            "content": "",
+            "error": "Oxylabs upstream failed.",
+        },
+    )
+
+    summary = await tracker._fetch_tracking_page_with_oxylabs(
+        tracking_url="https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+        normalized_awb="00622953556",
+        current_summary={
+            "tracking_url": "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+            "normalized_awb": "00622953556",
+            "visible_text": "Access Denied\nReference #18.abc123",
+            "page_title": "Access Denied",
+            "final_url": "https://errors.edgesuite.net/18.abc123",
+            "access_denied_detected": True,
+            "fetch_failed": False,
+            "warning": "Delta Cargo access denied by Akamai after retries.",
+            "oxylabs_used": False,
+            "oxylabs_status_code": None,
+            "oxylabs_error": None,
+        },
+    )
+
+    assert summary["warning"] == "Delta Cargo access denied by Akamai after retries."
+    assert summary["oxylabs_used"] is True
+    assert summary["oxylabs_status_code"] == 502
+    assert summary["oxylabs_error"] == "Oxylabs upstream failed."
+
+
+@pytest.mark.asyncio
+async def test_delta_oxylabs_success_passes_text_into_parser(monkeypatch) -> None:
+    tracker = DeltaTracker()
+    monkeypatch.setattr(
+        "app.trackers.delta.fetch_with_oxylabs",
+        lambda url: {
+            "ok": True,
+            "status_code": 200,
+            "content": """
+                <html>
+                  <body>
+                    <div>Status</div>
+                    <div>Arrived</div>
+                    <div>ETA</div>
+                    <div>2026-05-02 14:30</div>
+                    <div>Origin</div>
+                    <div>SFO</div>
+                    <div>Destination</div>
+                    <div>ATL</div>
+                    <div>Last Update</div>
+                    <div>2026-05-01 08:15</div>
+                  </body>
+                </html>
+            """,
+            "error": None,
+            "result_url": "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+        },
+    )
+
+    summary = await tracker._fetch_tracking_page_with_oxylabs(
+        tracking_url="https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+        normalized_awb="00622953556",
+        current_summary={
+            "tracking_url": "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556",
+            "normalized_awb": "00622953556",
+            "visible_text": "Access Denied\nReference #18.abc123",
+            "page_title": "Access Denied",
+            "final_url": "https://errors.edgesuite.net/18.abc123",
+            "access_denied_detected": True,
+            "fetch_failed": False,
+            "warning": "Delta Cargo access denied by Akamai after retries.",
+            "oxylabs_used": False,
+            "oxylabs_status_code": None,
+            "oxylabs_error": None,
+        },
+    )
+
+    parsed = tracker.parse_tracking_text(summary["visible_text"])
+
+    assert summary["oxylabs_used"] is True
+    assert summary["oxylabs_status_code"] == 200
+    assert summary["oxylabs_error"] is None
+    assert summary["fetch_failed"] is False
+    assert summary["warning"] is None
+    assert summary["access_denied_detected"] is False
+    assert parsed == {
+        "status": "Arrived",
+        "eta": "2026-05-02 14:30",
+        "origin": "SFO",
+        "destination": "ATL",
+        "last_update": "2026-05-01 08:15",
+        "exception": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delta_tracker_ignores_already_closed_context_cleanup(monkeypatch) -> None:
+    tracker = DeltaTracker()
+
+    class FakeContext:
+        async def add_init_script(self, script: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs):
+            return FakeContext()
+
+        async def close(self) -> None:
+            return None
+
+    class FakeChromium:
+        async def launch(self, **kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        def __init__(self) -> None:
+            self.chromium = FakeChromium()
+
+        async def stop(self) -> None:
+            return None
+
+    class FakeAsyncPlaywrightStarter:
+        async def start(self) -> FakePlaywright:
+            return FakePlaywright()
+
+    async def fake_fetch_with_retries(
+        context,
+        tracking_url: str,
+        original_awb: str,
+        normalized_awb: str,
+    ):
+        return {
+            "tracking_url": tracking_url,
+            "normalized_awb": normalized_awb,
+            "visible_text": "Access Denied\nReference #18.abc123",
+            "page_title": "Access Denied",
+            "final_url": "https://errors.edgesuite.net/18.abc123",
+            "retry_count": 2,
+            "access_denied_detected": True,
+            "screenshot_path": None,
+            "fetch_failed": False,
+            "warning": "Delta Cargo access denied by Akamai after retries.",
+        }
+
+    monkeypatch.setattr(
+        "app.trackers.delta.async_playwright",
+        lambda: FakeAsyncPlaywrightStarter(),
+    )
+    monkeypatch.setattr(tracker, "_fetch_with_retries", fake_fetch_with_retries)
+
+    result = await tracker.track(
+        ShipmentRequest(
+            carrier="Delta",
+            awb="006-22953556",
+            customer="Inland",
+            po_number=None,
+            notify_email="employee@company.com",
+            arrival_location="ATL",
+        )
+    )
+
+    assert result.raw_summary["tracking_url"] == (
+        "https://www.deltacargo.com/Cargo/trackShipment?awbNumber=00622953556"
+    )
+    assert result.raw_summary["normalized_awb"] == "00622953556"
+    assert result.raw_summary["page_title"] == "Access Denied"
+    assert result.raw_summary["final_url"] == "https://errors.edgesuite.net/18.abc123"
+    assert result.raw_summary["retry_count"] == 2
+    assert result.raw_summary["access_denied_detected"] is True
+    assert result.raw_summary["warning"] == (
+        "Delta Cargo access denied by Akamai after retries."
+    )
+    assert "cleanup_warning" not in result.raw_summary
+    assert result.error == "Delta Cargo access denied by Akamai after retries."
