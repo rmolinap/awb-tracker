@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     tracker_timeout_seconds: int = 30
+    track_trace_enabled: bool = True
     enable_screenshots: bool = False
     screenshot_dir: str = "./screenshots"
     playwright_headless: bool = True

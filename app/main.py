@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from app.models import HealthResponse, TrackRequest, TrackResponse
-from app.trackers.registry import get_tracker
+from app.services.tracking import track_shipment
 
 app = FastAPI(title="Air Cargo AWB Tracking Service")
 
@@ -15,7 +15,6 @@ async def health() -> HealthResponse:
 async def track_shipments(payload: TrackRequest) -> TrackResponse:
     results = []
     for shipment in payload.shipments:
-        tracker = get_tracker(shipment.carrier)
-        result = await tracker.track(shipment)
+        result = await track_shipment(shipment)
         results.append(result)
     return TrackResponse(results=results)

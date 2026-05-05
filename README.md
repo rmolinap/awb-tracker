@@ -18,15 +18,17 @@ app/
   main.py
   models.py
   config.py
-  trackers/
-    __init__.py
-    base.py
-    delta.py
-    registry.py
   services/
     __init__.py
     normalize.py
     oxylabs.py
+    tracking.py
+  trackers/
+    __init__.py
+    base.py
+    delta.py
+    track_trace.py
+    registry.py
 tests/
   fixtures/
 ```
@@ -45,7 +47,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-If browser installation is skipped, the Delta tracker still returns structured results, but live page capture may include an error message in the response.
+If browser installation is skipped, the Delta tracker still returns structured results, but live page capture may include an error message in the response. TrackTrace also uses Playwright first and falls back to the carrier-specific tracker if Chromium is unavailable or the generic pass cannot complete.
 
 ## Environment variables
 
@@ -57,6 +59,7 @@ cp .env.example .env
 
 Available settings:
 - `TRACKER_TIMEOUT_SECONDS`
+- `TRACK_TRACE_ENABLED`
 - `ENABLE_SCREENSHOTS`
 - `SCREENSHOT_DIR`
 - `PLAYWRIGHT_HEADLESS`
@@ -135,6 +138,32 @@ curl -X POST http://127.0.0.1:8000/track \
 - Use `tracking_url`, `raw_summary`, and `error` for debugging failed or partial carrier lookups.
 - `raw_summary` keeps the original visible page text and parsed debug fields for support work.
 - Future reporting steps can map `status`, `eta`, `origin`, `destination`, and `last_update` into Google Sheets columns and internal email summaries.
+
+## TrackTrace first-pass flow
+
+When `TRACK_TRACE_ENABLED=true`, the service tries [TrackTrace air cargo](https://www.track-trace.com/aircargo) before the carrier-specific tracker:
+- opens the TrackTrace air cargo page in Playwright
+- enters the AWB in `123-12345675` format
+- prefers `Track direct` so the request can hand off to the airline result page instead of the TrackTrace options frame
+- returns the TrackTrace result directly if it parsed useful structured shipment fields
+- falls back to the existing carrier-specific tracker when TrackTrace times out, fails, or does not produce useful structured fields
+
+When to rely on each path:
+- Use TrackTrace as the first pass for broader carrier coverage, especially when there is no dedicated airline tracker yet.
+- Use the carrier-specific tracker when TrackTrace does not yield structured fields or when an airline-specific parser can read the final page more reliably.
+- Delta still keeps its existing direct Playwright flow and Oxylabs fallback after any TrackTrace miss.
+
+TrackTrace debug data stays in `raw_summary` and includes `page_title`, `final_url`, `visible_text`, `html_content`, `direct_resolution_type`, `used_frame`, and `delta_direct_behavior` when relevant.
+
+## TrackTrace Delta behavior
+
+For Delta AWBs, TrackTrace `Track direct` currently resolves through a hidden HTML form that targets Delta Cargo instead of returning a simple redirect URL.
+
+The TrackTrace tracker handles that by:
+- forcing same-tab direct navigation instead of TrackTrace's default new-tab behavior
+- reading the hidden direct-form response when TrackTrace returns `direct-type=form`
+- submitting the Delta handoff in-page so the flow avoids the TrackTrace options frame
+- recording that behavior in `raw_summary.delta_direct_behavior`
 
 ## Delta Akamai behavior
 

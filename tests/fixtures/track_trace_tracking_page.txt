@@ -1,0 +1,14 @@
+Track & Trace
+Air cargo tracking
+AWB
+020-12345675
+Current Status
+Received from airline
+Origin
+AMS
+Destination
+JFK
+ETA
+2026-05-03 11:40
+Last update
+2026-05-02 18:25

@@ -1,9 +1,13 @@
+import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.main import app
 from app.models import ShipmentRequest
+from app.trackers.base import BaseTracker
 from app.trackers.delta import DeltaTracker
 from app.trackers.registry import TRACKER_REGISTRY
+from app.trackers.track_trace import TrackTraceTracker
 
 
 class FakeDeltaTracker(DeltaTracker):
@@ -30,6 +34,30 @@ class FakeDeltaTracker(DeltaTracker):
         return result
 
 
+class FakeTrackTraceTracker(TrackTraceTracker):
+    async def track(self, shipment: ShipmentRequest):
+        result = self.build_base_result(shipment)
+        result.tracking_url = "https://www.track-trace.com/aircargo"
+        result.raw_summary = {
+            "provider": "track_trace",
+            "tracking_url": "https://www.track-trace.com/aircargo",
+            "visible_text": "Current Status\nReceived from airline\nOrigin\nAMS\nDestination\nJFK",
+            "final_url": "https://www.track-trace.com/aircargo",
+            "parsed_fields": {
+                "status": "Received from airline",
+                "eta": None,
+                "origin": "AMS",
+                "destination": "JFK",
+                "last_update": None,
+                "exception": False,
+            },
+        }
+        result.status = "Received from airline"
+        result.origin = "AMS"
+        result.destination = "JFK"
+        return result
+
+
 client = TestClient(app)
 
 
@@ -41,6 +69,7 @@ def test_health() -> None:
 
 
 def test_track_valid_payload(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "track_trace_enabled", False)
     monkeypatch.setitem(TRACKER_REGISTRY, "delta", FakeDeltaTracker())
 
     response = client.post(
@@ -95,7 +124,8 @@ def test_track_valid_payload(monkeypatch) -> None:
     }
 
 
-def test_track_unsupported_carrier_returns_structured_error() -> None:
+def test_track_unsupported_carrier_returns_structured_error(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "track_trace_enabled", False)
     response = client.post(
         "/track",
         json={
@@ -122,6 +152,7 @@ def test_track_unsupported_carrier_returns_structured_error() -> None:
 
 
 def test_track_delta_oxylabs_failure_returns_structured_error(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "track_trace_enabled", False)
     tracker = DeltaTracker()
 
     async def fake_fetch_tracking_page(tracking_url: str, original_awb: str):
@@ -167,4 +198,96 @@ def test_track_delta_oxylabs_failure_returns_structured_error(monkeypatch) -> No
     assert payload["results"][0]["raw_summary"]["oxylabs_status_code"] == 502
     assert payload["results"][0]["raw_summary"]["oxylabs_error"] == (
         "Oxylabs upstream failed."
+    )
+
+
+def test_track_uses_track_trace_first_when_enabled(monkeypatch) -> None:
+    from app.services import tracking as tracking_service
+
+    class FailIfCalledTracker(BaseTracker):
+        async def track(self, shipment: ShipmentRequest):
+            raise AssertionError("Carrier tracker should not run when TrackTrace succeeds.")
+
+    monkeypatch.setattr(settings, "track_trace_enabled", True)
+    monkeypatch.setattr(tracking_service, "TRACK_TRACE_TRACKER", FakeTrackTraceTracker())
+    monkeypatch.setitem(TRACKER_REGISTRY, "delta", FailIfCalledTracker())
+
+    response = client.post(
+        "/track",
+        json={
+            "shipments": [
+                {
+                    "carrier": "Delta",
+                    "awb": "006-22953556",
+                    "customer": "Inland",
+                    "po_number": None,
+                    "notify_email": "employee@company.com",
+                    "arrival_location": "ATL",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"][0]["status"] == "Received from airline"
+    assert payload["results"][0]["origin"] == "AMS"
+    assert payload["results"][0]["tracking_url"] == "https://www.track-trace.com/aircargo"
+
+
+def test_track_falls_back_to_carrier_tracker_when_track_trace_fails(monkeypatch) -> None:
+    from app.services import tracking as tracking_service
+
+    class FailingTrackTraceTracker(TrackTraceTracker):
+        async def track(self, shipment: ShipmentRequest):
+            result = self.build_base_result(shipment)
+            result.tracking_url = "https://www.track-trace.com/aircargo"
+            result.raw_summary = {
+                "provider": "track_trace",
+                "tracking_url": "https://www.track-trace.com/aircargo",
+                "visible_text": "",
+                "final_url": "https://www.track-trace.com/aircargo",
+                "parsed_fields": {
+                    "status": None,
+                    "eta": None,
+                    "origin": None,
+                    "destination": None,
+                    "last_update": None,
+                    "exception": False,
+                },
+                "fetch_failed": True,
+                "warning": "TrackTrace timed out.",
+            }
+            result.error = "TrackTrace timed out."
+            return result
+
+    monkeypatch.setattr(settings, "track_trace_enabled", True)
+    monkeypatch.setattr(
+        tracking_service,
+        "TRACK_TRACE_TRACKER",
+        FailingTrackTraceTracker(),
+    )
+    monkeypatch.setitem(TRACKER_REGISTRY, "delta", FakeDeltaTracker())
+
+    response = client.post(
+        "/track",
+        json={
+            "shipments": [
+                {
+                    "carrier": "Delta",
+                    "awb": "006-22953556",
+                    "customer": "Inland",
+                    "po_number": None,
+                    "notify_email": "employee@company.com",
+                    "arrival_location": "ATL",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["results"][0]["status"] == "Arrived"
+    assert payload["results"][0]["raw_summary"]["track_trace"]["warning"] == (
+        "TrackTrace timed out."
     )
